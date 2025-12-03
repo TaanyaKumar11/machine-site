@@ -1,0 +1,294 @@
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Teachable-like Photo Classifier (TFJS)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Roboto, sans-serif; padding: 12px; max-width: 900px; margin:auto; }
+    .class-block { border:1px solid #ddd; padding:10px; margin:10px 0; border-radius:8px; }
+    img.preview { max-width:100px; margin:6px; border-radius:6px; }
+    #status { margin:10px 0; white-space:pre-wrap; }
+    button { margin:6px 6px 6px 0; }
+  </style>
+</head>
+<body>
+  <h1>Photo Classifier — Browser (no app)</h1>
+
+  <div>
+    <button id="addClassBtn">+ Add Class</button>
+    <button id="trainBtn">Train</button>
+    <button id="predictBtn">Predict</button>
+    <button id="saveDownloadBtn">Download Model</button>
+    <button id="saveIndexeddbBtn">Save to IndexedDB</button>
+  </div>
+
+  <div id="classes"></div>
+
+  <div style="margin-top:12px;">
+    <label>Pick a photo to predict:</label><br>
+    <input id="predictFile" type="file" accept="image/*">
+    <div id="predictPreview"></div>
+    <div id="predResult"></div>
+  </div>
+
+  <div id="status">Status: Idle</div>
+
+  <!-- TensorFlow.js -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.13.0/dist/tf.min.js"></script>
+  <!-- We will load a MobileNet model via tf.loadLayersModel (see code) -->
+  <script>
+  // ---------- Minimal UI logic ----------
+  const classesDiv = document.getElementById('classes');
+  const addClassBtn = document.getElementById('addClassBtn');
+  const trainBtn = document.getElementById('trainBtn');
+  const predictBtn = document.getElementById('predictBtn');
+  const saveDownloadBtn = document.getElementById('saveDownloadBtn');
+  const saveIndexeddbBtn = document.getElementById('saveIndexeddbBtn');
+  const statusEl = document.getElementById('status');
+  const predictFile = document.getElementById('predictFile');
+  const predictPreview = document.getElementById('predictPreview');
+  const predResult = document.getElementById('predResult');
+
+  let classCount = 0;
+  function addClassBlock(label='Class ' + (classCount+1)) {
+    const id = 'class' + (++classCount);
+    const div = document.createElement('div');
+    div.className = 'class-block';
+    div.id = id;
+    div.innerHTML = `
+      <label>Label: <input class="label" value="${label}" /></label>
+      <button class="remove">Remove</button>
+      <div>
+        <input type="file" class="files" accept="image/*" multiple />
+      </div>
+      <div class="previews"></div>
+    `;
+    classesDiv.appendChild(div);
+
+    div.querySelector('.files').addEventListener('change', (ev) => {
+      const previews = div.querySelector('.previews');
+      previews.innerHTML = '';
+      for (const f of ev.target.files) {
+        const img = document.createElement('img');
+        img.className = 'preview';
+        img.file = f;
+        previews.appendChild(img);
+        const reader = new FileReader();
+        reader.onload = (e) => { img.src = e.target.result; };
+        reader.readAsDataURL(f);
+      }
+    });
+    div.querySelector('.remove').addEventListener('click', ()=> div.remove());
+  }
+
+  addClassBtn.addEventListener('click', ()=> addClassBlock());
+
+  addClassBlock('Class 1');
+  addClassBlock('Class 2');
+
+  // ---------- TFJS transfer learning logic ----------
+  const IMAGE_SIZE = 224; // MobileNet default
+  let truncatedMobileNet; // feature extractor
+  let classifier;         // small classifier model
+  let examplesByClass = {}; // {label: [ImageElement,...]}
+
+  setStatus('Loading mobilenet (this may take a few seconds)...');
+  (async function init() {
+    // load MobileNet (a lightweight pre-trained model). We'll load a hosted layers model:
+    // model URL below is a stable TFJS MobileNet v1 (0.25) — works in-browser.
+    const mobilenetURL = 'https://storage.googleapis.com/tfjs-models/tfjs/mobilenet_v1_0.25_224/model.json';
+    const mobilenet = await tf.loadLayersModel(mobilenetURL);
+    // create a truncated model that outputs an embedding (drop final classification layers)
+    // choose a convolutional layer near the end:
+    const layer = mobilenet.getLayer('conv_pw_13_relu'); // common layer in mobilenet v1
+    truncatedMobileNet = tf.model({inputs: mobilenet.inputs, outputs: layer.output});
+    setStatus('MobileNet loaded. Ready. Add photos per class and click Train.');
+  })();
+
+  function setStatus(txt){ statusEl.textContent = 'Status: ' + txt; console.log(txt); }
+
+  function gatherExamples() {
+    examplesByClass = {};
+    const classBlocks = document.querySelectorAll('.class-block');
+    for (const block of classBlocks) {
+      const label = block.querySelector('.label').value.trim() || 'unnamed';
+      const fileInput = block.querySelector('.files');
+      if (!fileInput.files || fileInput.files.length === 0) continue;
+      examplesByClass[label] = examplesByClass[label] || [];
+      for (const f of fileInput.files) {
+        // create an Image element (dataURL) for each file
+        const img = new Image();
+        img.src = URL.createObjectURL(f);
+        examplesByClass[label].push(img);
+      }
+    }
+    return examplesByClass;
+  }
+
+  // preprocess an HTMLImageElement -> tensor ready for MobileNet
+  function preprocess(imgEl) {
+    // create tensor from image element
+    return tf.tidy(()=> {
+      let t = tf.browser.fromPixels(imgEl).toFloat();
+      // Resize to IMAGE_SIZE x IMAGE_SIZE
+      const resized = tf.image.resizeBilinear(t, [IMAGE_SIZE, IMAGE_SIZE]);
+      // normalize to [-1,1] (MobileNet expects this)
+      const offset = tf.scalar(127.5);
+      const normalized = resized.div(offset).sub(tf.scalar(1));
+      // shape: [h,w,3] -> return [1,h,w,3]
+      return normalized.expandDims(0);
+    });
+  }
+
+  async function buildAndTrainClassifier() {
+    const byClass = gatherExamples();
+    const labels = Object.keys(byClass);
+    if (labels.length < 2) {
+      setStatus('Need at least 2 classes with images to train.');
+      return;
+    }
+
+    setStatus('Converting images to embeddings...');
+    // Build embedding tensors and labels
+    const xsList = [];
+    const ysList = [];
+    for (let i=0;i<labels.length;i++) {
+      const label = labels[i];
+      const imgs = byClass[label];
+      for (const imgEl of imgs) {
+        // Wait for image to load (it may be still loading from blob URL)
+        if (!imgEl.complete) await new Promise(res=> imgEl.onload = res);
+        const imgTensor = preprocess(imgEl); // [1,224,224,3]
+        // pass through truncated MobileNet to get embedding
+        const embedding = tf.tidy(()=> truncatedMobileNet.predict(imgTensor));
+        // flatten the embedding for classifier training
+        const flat = embedding.flatten(); // [N]
+        xsList.push(flat);
+        // one-hot label
+        const y = new Array(labels.length).fill(0); y[i] = 1;
+        ysList.push(y);
+        imgTensor.dispose();
+        embedding.dispose();
+      }
+    }
+
+    // Stack into single tensors
+    setStatus(`Stacking ${xsList.length} examples for ${labels.length} classes...`);
+    const xs = tf.stack(xsList);
+    const ys = tf.tensor2d(ysList);
+
+    // free per-example tensors
+    xsList.forEach(t => t.dispose());
+
+    // Build classifier model
+    const embeddingShape = xs.shape.slice(1); // e.g. [7,7,256] flattened to product -> but we flattened already
+    // Because we flattened earlier, embeddingShape is length (N)
+    const inputDim = xs.shape[1];
+    classifier = tf.sequential();
+    classifier.add(tf.layers.dense({inputShape: [inputDim], units: 100, activation: 'relu'}));
+    classifier.add(tf.layers.dropout({rate: 0.4}));
+    classifier.add(tf.layers.dense({units: labels.length, activation: 'softmax'}));
+    classifier.compile({optimizer: tf.train.adam(0.0005), loss: 'categoricalCrossentropy', metrics: ['accuracy']});
+
+    setStatus('Training classifier (this may be slow on mobile)...');
+    // Train
+    await classifier.fit(xs, ys, {
+      epochs: 20,
+      batchSize: Math.min(16, xs.shape[0]),
+      callbacks: {
+        onEpochEnd: (epoch, logs) => setStatus(`Epoch ${epoch+1}: loss=${logs.loss.toFixed(4)} acc=${(logs.acc||logs.acc).toFixed ? (logs.acc||logs.acc).toFixed(3) : logs.acc}`),
+      }
+    });
+
+    xs.dispose(); ys.dispose();
+    setStatus('Training complete. You can now Predict or save the model.');
+    // store labels for prediction
+    classifier._labels = labels;
+  }
+
+  trainBtn.addEventListener('click', async ()=> {
+    try {
+      setStatus('Preparing to train...');
+      await buildAndTrainClassifier();
+    } catch (e) {
+      console.error(e);
+      setStatus('Error during training: ' + e.message);
+    }
+  });
+
+  // Predict function: takes an image file, runs same preprocessing -> embedding -> classifier
+  async function predictFromImageFile(file) {
+    if (!classifier || !truncatedMobileNet) {
+      setStatus('Model not ready. Train first.');
+      return;
+    }
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.src = url;
+    await new Promise(res => img.onload = res);
+    const t = preprocess(img); // [1,224,224,3]
+    const embedding = tf.tidy(()=> truncatedMobileNet.predict(t));
+    const flat = embedding.flatten().expandDims(0); // [1,inputDim]
+    const pred = classifier.predict(flat);
+    const data = await pred.data();
+    const labels = classifier._labels || [];
+    // find top result
+    let bestIdx = 0, bestScore = data[0];
+    for (let i=1;i<data.length;i++) if (data[i] > bestScore) { bestScore = data[i]; bestIdx = i; }
+    // cleanup
+    t.dispose(); embedding.dispose(); flat.dispose(); pred.dispose();
+    URL.revokeObjectURL(url);
+    return {label: labels[bestIdx], score: bestScore, all: Array.from(data).map((v,i)=>({label: labels[i], score:v}))};
+  }
+
+  predictFile.addEventListener('change', async (ev)=> {
+    predResult.textContent = '';
+    predictPreview.innerHTML = '';
+    const f = ev.target.files[0];
+    if (!f) return;
+    const img = document.createElement('img');
+    img.className = 'preview';
+    img.src = URL.createObjectURL(f);
+    predictPreview.appendChild(img);
+
+    setStatus('Running prediction...');
+    try {
+      const r = await predictFromImageFile(f);
+      if (!r) { setStatus('No result'); return;}
+      predResult.textContent = `Prediction: ${r.label}  (confidence ${(r.score*100).toFixed(1)}%)\n\nAll scores:\n${r.all.map(a=> `${a.label}: ${(a.score*100).toFixed(1)}%`).join('\n')}`;
+      setStatus('Prediction done.');
+    } catch (e) {
+      setStatus('Prediction error: ' + e.message);
+    }
+  });
+
+  // Save model to download
+  saveDownloadBtn.addEventListener('click', async ()=> {
+    if (!classifier) { setStatus('No classifier found. Train first.'); return; }
+    setStatus('Preparing model for download...');
+    // We need to create a combined model: inputs -> truncatedMobileNet -> classifier
+    // Build a model that maps image input to classifier output so it can be saved.
+    const input = tf.input({shape: [IMAGE_SIZE, IMAGE_SIZE, 3]});
+    // Preprocessing layer (normalize) as lambda isn't trivial: we'll instead require user to use the same preprocess routine.
+    // Instead, we create a model that takes the *embedding* as input: easier to save both separately.
+    // Save classifier and save truncatedMobileNet separately
+    await classifier.save('downloads://my-classifier');
+    await truncatedMobileNet.save('downloads://my-truncated-mobilenet');
+    setStatus('Saved classifier and truncated MobileNet as downloads. Reimport later by loading both.');
+  });
+
+  // Save to IndexedDB (in-browser)
+  saveIndexeddbBtn.addEventListener('click', async ()=> {
+    if (!classifier) { setStatus('No classifier found. Train first.'); return; }
+    setStatus('Saving classifier to IndexedDB...');
+    await classifier.save('indexeddb://my-classifier');
+    await truncatedMobileNet.save('indexeddb://my-truncated-mobilenet');
+    setStatus('Saved to IndexedDB. You can load with tf.loadLayersModel("indexeddb://my-classifier")');
+  });
+
+  // Bonus: allow prediction button to simulate selecting a file if user already loaded
+  predictBtn.addEventListener('click', ()=> predictFile.click());
+
+  </script>
+</body>
+</html>
